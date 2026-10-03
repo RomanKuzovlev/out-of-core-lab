@@ -1,12 +1,11 @@
-#include <algorithm>
 #include <cerrno>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <fcntl.h>
 #include <iostream>
-#include <string>
+#include <limits>
+#include <random>
 #include <string_view>
 #include <unistd.h>
 #include <vector>
@@ -14,6 +13,11 @@
 int main(int argc, char *argv[])
 {
     constexpr std::size_t blockSize = 4096 * 1024; // 4 MiB
+    constexpr std::size_t dimensions = 128;
+    static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
+                  "The dataset requires 32-bit IEEE 754 floats.");
+    static_assert(blockSize % (dimensions * sizeof(float)) == 0,
+                  "Each block must contain whole vectors.");
     constexpr std::uint64_t targetSize = std::uint64_t{32} * 1024 * 1024 * 1024;
     std::uint64_t blocksAmount = targetSize / blockSize;
 
@@ -34,8 +38,14 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Allocate once and reuse for every block.
-    std::vector<char> buffer(blockSize);
+    // Headerless file: contiguous vectors of 128 floats, in native byte order.
+    // Each 4 MiB block holds 8,192 vectors. Reuse this allocation throughout.
+    std::vector<float> buffer(blockSize / sizeof(float));
+
+    // Seed once; the sequence continues across blocks. Reproducibility assumes
+    // the same generator and standard-library distribution implementation.
+    std::mt19937 generator(42);
+    std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
 
     // Create a new file; fail if the path already exists.
     const int fd = open(argv[1], O_WRONLY | O_CREAT | O_EXCL, 0644);
@@ -48,20 +58,16 @@ int main(int argc, char *argv[])
     bool failed = false;
     for (std::uint64_t i = 0; i < blocksAmount; ++i)
     {
-        const std::string value = std::to_string(i) + "yo";
+        for (float &value : buffer)
+            value = distribution(generator);
 
-        // Repeat the pattern, trimming the final copy to the remaining space.
-        for (std::size_t offset = 0; offset < blockSize;)
-        {
-            const std::size_t amount = std::min(value.size(), blockSize - offset);
-            std::memcpy(buffer.data() + offset, value.data(), amount);
-            offset += amount;
-        }
+        // write() counts bytes, so partial-write offsets need a byte pointer.
+        const char *bytes = reinterpret_cast<const char *>(buffer.data());
 
         std::size_t bytesWritten = 0;
         while (bytesWritten < blockSize)
         {
-            const ssize_t result = write(fd, buffer.data() + bytesWritten, blockSize - bytesWritten);
+            const ssize_t result = write(fd, bytes + bytesWritten, blockSize - bytesWritten);
             if (result < 0)
             {
                 // A signal interrupted the call before any bytes were written.
