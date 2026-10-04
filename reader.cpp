@@ -1,11 +1,12 @@
 #include <cerrno>
-#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <fcntl.h>
 #include <iostream>
 #include <limits>
-#include <string_view>
+#include <stdexcept>
+#include <sys/stat.h>
+#include <system_error>
 #include <unistd.h>
 #include <vector>
 
@@ -15,35 +16,18 @@ int main(int argc, char *argv[])
     static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
                   "The dataset requires 32-bit IEEE 754 floats.");
 
-    if (argc < 2 || argc > 3)
+    if (argc > 2)
     {
-        std::cerr << "Usage: " << argv[0] << " BLOCK_INDEX [FILE]\n"
-                  << "FILE defaults to sample.bin; indices start at zero.\n";
+        std::cerr << "Usage: " << argv[0] << " [FILE]\n"
+                  << "FILE defaults to sample.bin; all blocks are read sequentially.\n";
         return 1;
     }
 
-    std::uint64_t blockIndex = 0;
-    const std::string_view indexText = argv[1];
-    const auto parsed = std::from_chars(indexText.data(), indexText.data() + indexText.size(), blockIndex);
-    if (parsed.ec != std::errc{} || parsed.ptr != indexText.data() + indexText.size())
-    {
-        std::cerr << "BLOCK_INDEX must be a nonnegative integer.\n";
-        return 1;
-    }
-
-    // Ensure both the starting offset and the full block fit in off_t.
-    const auto maxOffset = static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
-    if (blockIndex > (maxOffset - blockSize) / blockSize)
-    {
-        std::cerr << "BLOCK_INDEX is too large for a file offset.\n";
-        return 1;
-    }
-    const off_t blockOffset = static_cast<off_t>(blockIndex * blockSize);
-
+    // Allocate once and reuse for every block.
     std::vector<float> buffer(blockSize / sizeof(float));
     char *bytes = reinterpret_cast<char *>(buffer.data());
 
-    const char *path = argc == 3 ? argv[2] : "sample.bin";
+    const char *path = argc == 2 ? argv[1] : "sample.bin";
     const int fd = open(path, O_RDONLY);
     if (fd == -1)
     {
@@ -51,41 +35,61 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    bool failed = false;
-    std::size_t bytesRead = 0;
-    while (bytesRead < blockSize)
+    int exitCode = 0;
+    try
     {
-        // Advance in both the destination buffer and the file after a short read.
-        const ssize_t result = pread(fd, bytes + bytesRead, blockSize - bytesRead,
-                                     blockOffset + static_cast<off_t>(bytesRead));
-        if (result < 0)
+        struct stat fileStat{};
+        if (fstat(fd, &fileStat) == -1)
+            throw std::system_error(errno, std::generic_category(), "fstat");
+        if (!S_ISREG(fileStat.st_mode))
+            throw std::runtime_error("Expected a regular dataset file.");
+        if (fileStat.st_size <= 0)
+            throw std::runtime_error("Dataset file is empty.");
+
+        const auto fileSize = static_cast<std::uint64_t>(fileStat.st_size);
+        if (fileSize % blockSize != 0)
+            throw std::runtime_error("File size is not a multiple of the 4 MiB block size.");
+        const std::uint64_t blocksToRead = fileSize / blockSize;
+
+        for (std::uint64_t blockIndex = 0; blockIndex < blocksToRead; ++blockIndex)
         {
-            if (errno == EINTR)
-                continue;
-            std::perror("pread");
-            failed = true;
-            break;
+            // The validated file size bounds every block offset within off_t.
+            const off_t blockOffset = static_cast<off_t>(blockIndex * blockSize);
+            std::size_t bytesRead = 0;
+            while (bytesRead < blockSize)
+            {
+                const ssize_t result = pread(fd, bytes + bytesRead, blockSize - bytesRead,
+                                             blockOffset + static_cast<off_t>(bytesRead));
+                if (result < 0)
+                {
+                    if (errno == EINTR)
+                        continue;
+                    throw std::system_error(errno, std::generic_category(), "pread");
+                }
+                if (result == 0)
+                    throw std::runtime_error("Unexpected end of file while reading a block.");
+
+                bytesRead += static_cast<std::size_t>(result);
+            }
+
+            // Inspect contents only after the entire block has been read.
+            std::cout << "Read block " << blockIndex << " at byte offset " << blockOffset
+                      << ": " << bytesRead << " bytes.\n";
+            std::cout << "First float: " << buffer.front()
+                      << "; last float: " << buffer.back() << '\n';
         }
-        if (result == 0)
-        {
-            std::cerr << "Reached end of file after " << bytesRead
-                      << " bytes; requested block is missing or incomplete.\n";
-            failed = true;
-            break;
-        }
-        bytesRead += static_cast<std::size_t>(result);
+    }
+    catch (const std::exception &error)
+    {
+        std::cerr << error.what() << '\n';
+        exitCode = 1;
     }
 
+    // Both normal completion and exceptions reach this cleanup.
     if (close(fd) == -1)
     {
         std::perror("close");
-        failed = true;
+        exitCode = 1;
     }
-    if (failed)
-        return 1;
-
-    std::cout << "Read block " << blockIndex << " at byte offset " << blockOffset
-              << ": " << bytesRead << " bytes.\n";
-    std::cout << "First float: " << buffer.front()
-              << "; last float: " << buffer.back() << '\n';
+    return exitCode;
 }
