@@ -9,6 +9,7 @@
 #include <system_error>
 #include <unistd.h>
 #include <vector>
+#include <chrono>
 
 int main(int argc, char *argv[])
 {
@@ -51,11 +52,18 @@ int main(int argc, char *argv[])
             throw std::runtime_error("File size is not a multiple of the 4 MiB block size.");
         const std::uint64_t blocksToRead = fileSize / blockSize;
 
+        // One latency per block, in seconds. Allocate storage before reading.
+        std::vector<std::chrono::duration<double>> measurements;
+        if (blocksToRead > measurements.max_size())
+            throw std::runtime_error("Too many blocks to store latency measurements.");
+        measurements.reserve(static_cast<std::size_t>(blocksToRead));
+
         for (std::uint64_t blockIndex = 0; blockIndex < blocksToRead; ++blockIndex)
         {
             // The validated file size bounds every block offset within off_t.
             const off_t blockOffset = static_cast<off_t>(blockIndex * blockSize);
             std::size_t bytesRead = 0;
+            const auto start{std::chrono::steady_clock::now()};
             while (bytesRead < blockSize)
             {
                 const ssize_t result = pread(fd, bytes + bytesRead, blockSize - bytesRead,
@@ -71,13 +79,17 @@ int main(int argc, char *argv[])
 
                 bytesRead += static_cast<std::size_t>(result);
             }
-
-            // Inspect contents only after the entire block has been read.
-            std::cout << "Read block " << blockIndex << " at byte offset " << blockOffset
-                      << ": " << bytesRead << " bytes.\n";
-            std::cout << "First float: " << buffer.front()
-                      << "; last float: " << buffer.back() << '\n';
+            const auto finish{std::chrono::steady_clock::now()};
+            // Record after stopping the timer; reserve() prevents reallocations.
+            measurements.emplace_back(finish - start);
         }
+
+        // Output only after the scan, preserving sequential request order
+        // (an OS can pre-read the next block while we are printing, thus skewing the measurment).
+        std::cout << "block_index,latency_seconds\n";
+        std::cout.precision(9);
+        for (std::size_t i = 0; i < measurements.size(); ++i)
+            std::cout << i << ',' << measurements[i].count() << '\n';
     }
     catch (const std::exception &error)
     {
@@ -91,5 +103,6 @@ int main(int argc, char *argv[])
         std::perror("close");
         exitCode = 1;
     }
+
     return exitCode;
 }
