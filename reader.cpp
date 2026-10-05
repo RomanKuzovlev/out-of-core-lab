@@ -1,3 +1,5 @@
+#include <cuda_runtime.h>
+
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -5,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
@@ -57,6 +60,15 @@ int main(int argc, char *argv[])
         if (blocksToRead > measurements.max_size())
             throw std::runtime_error("Too many blocks to store latency measurements.");
         measurements.reserve(static_cast<std::size_t>(blocksToRead));
+
+        // CUDA. Query once, before reading. The count is valid only on success.
+        int deviceCount = 0;
+        const cudaError_t status = cudaGetDeviceCount(&deviceCount);
+        if (status != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA device query: ") + cudaGetErrorString(status));
+        if (deviceCount == 0)
+            throw std::runtime_error("No CUDA-capable GPU is available.");
+        std::cerr << "CUDA devices available: " << deviceCount << '\n';
 
         for (std::uint64_t blockIndex = 0; blockIndex < blocksToRead; ++blockIndex)
         {
