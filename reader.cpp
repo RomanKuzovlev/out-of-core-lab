@@ -40,6 +40,8 @@ int main(int argc, char *argv[])
     }
 
     int exitCode = 0;
+    // Keep the pointer in scope for cleanup even if the scan throws.
+    void *gpuBuffer = nullptr;
     try
     {
         struct stat fileStat{};
@@ -69,6 +71,12 @@ int main(int argc, char *argv[])
         if (deviceCount == 0)
             throw std::runtime_error("No CUDA-capable GPU is available.");
         std::cerr << "CUDA devices available: " << deviceCount << '\n';
+
+        // Allocate one block in GPU memory before the scan.
+        const cudaError_t allocationStatus = cudaMalloc(&gpuBuffer, blockSize);
+        if (allocationStatus != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA allocation: ") + cudaGetErrorString(allocationStatus));
+        std::cerr << "Allocated GPU buffer: " << blockSize << " bytes.\n";
 
         for (std::uint64_t blockIndex = 0; blockIndex < blocksToRead; ++blockIndex)
         {
@@ -110,6 +118,17 @@ int main(int argc, char *argv[])
     }
 
     // Both normal completion and exceptions reach this cleanup.
+    if (gpuBuffer != nullptr)
+    {
+        const cudaError_t freeStatus = cudaFree(gpuBuffer);
+        if (freeStatus != cudaSuccess)
+        {
+            std::cerr << "CUDA deallocation: " << cudaGetErrorString(freeStatus) << '\n';
+            exitCode = 1;
+        }
+        else
+            std::cerr << "Freed GPU buffer.\n";
+    }
     if (close(fd) == -1)
     {
         std::perror("close");
