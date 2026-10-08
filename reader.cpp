@@ -102,6 +102,13 @@ int main(int argc, char *argv[])
             const auto finish{std::chrono::steady_clock::now()};
             // Record after stopping the timer; reserve() prevents reallocations.
             measurements.emplace_back(finish - start);
+
+            // Copy the completed RAM block into the reusable GPU allocation.
+            // This transfer is outside the disk-read latency measurement.
+            const cudaError_t copyStatus = cudaMemcpy(gpuBuffer, buffer.data(), blockSize,
+                                                       cudaMemcpyHostToDevice);
+            if (copyStatus != cudaSuccess)
+                throw std::runtime_error(std::string("CUDA host-to-device copy: ") + cudaGetErrorString(copyStatus));
         }
 
         // Output only after the scan, preserving sequential request order
