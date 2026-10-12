@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <device_launch_parameters.h>
 
 #include <cerrno>
 #include <cstdint>
@@ -14,11 +15,29 @@
 #include <vector>
 #include <chrono>
 
+constexpr unsigned int dimensions = 128;
+
+__global__ void dotProducts(const float *blockOfVectors, const float *query,
+                            float *scores, unsigned int vectorCount)
+{
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= vectorCount)
+        return;
+
+    float score = 0.0f;
+    for (unsigned int d = 0; d < dimensions; ++d)
+        score += blockOfVectors[i * dimensions + d] * query[d];
+    scores[i] = score;
+}
+
 int main(int argc, char *argv[])
 {
     constexpr std::size_t blockSize = 4096 * 1024; // 4 MiB
     static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
                   "The dataset requires 32-bit IEEE 754 floats.");
+    static_assert(blockSize % (dimensions * sizeof(float)) == 0,
+                  "Each block must contain whole vectors.");
+    constexpr unsigned int vectorsPerBlock = blockSize / (dimensions * sizeof(float));
 
     if (argc > 2)
     {
@@ -42,6 +61,8 @@ int main(int argc, char *argv[])
     int exitCode = 0;
     // Keep the pointer in scope for cleanup even if the scan throws.
     void *gpuBuffer = nullptr;
+    float *gpuQuery = nullptr;
+    float *gpuScores = nullptr;
     try
     {
         struct stat fileStat{};
@@ -78,6 +99,25 @@ int main(int argc, char *argv[])
             throw std::runtime_error(std::string("CUDA allocation: ") + cudaGetErrorString(allocationStatus));
         std::cerr << "Allocated GPU buffer: " << blockSize << " bytes.\n";
 
+        // A fixed all-ones query makes the first computation easy to verify.
+        std::vector<float> query(dimensions, 1.0f);
+        std::vector<float> scores(vectorsPerBlock); // RAM destination for future results.
+
+        const cudaError_t queryAllocationStatus = cudaMalloc(&gpuQuery, query.size() * sizeof(float));
+        if (queryAllocationStatus != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA query allocation: ") + cudaGetErrorString(queryAllocationStatus));
+        const cudaError_t scoresAllocationStatus = cudaMalloc(&gpuScores, scores.size() * sizeof(float));
+        if (scoresAllocationStatus != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA scores allocation: ") + cudaGetErrorString(scoresAllocationStatus));
+
+        const cudaError_t queryCopyStatus = cudaMemcpy(gpuQuery, query.data(), query.size() * sizeof(float),
+                                                       cudaMemcpyHostToDevice);
+        if (queryCopyStatus != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA query copy: ") + cudaGetErrorString(queryCopyStatus));
+        // GPU scores need no initialization: the kernel will overwrite every valid slot.
+        std::cerr << "Allocated query: " << query.size() * sizeof(float)
+                  << " bytes; scores: " << scores.size() * sizeof(float) << " bytes.\n";
+
         for (std::uint64_t blockIndex = 0; blockIndex < blocksToRead; ++blockIndex)
         {
             // The validated file size bounds every block offset within off_t.
@@ -106,7 +146,7 @@ int main(int argc, char *argv[])
             // Copy the completed RAM block into the reusable GPU allocation.
             // This transfer is outside the disk-read latency measurement.
             const cudaError_t copyStatus = cudaMemcpy(gpuBuffer, buffer.data(), blockSize,
-                                                       cudaMemcpyHostToDevice);
+                                                      cudaMemcpyHostToDevice);
             if (copyStatus != cudaSuccess)
                 throw std::runtime_error(std::string("CUDA host-to-device copy: ") + cudaGetErrorString(copyStatus));
         }
@@ -125,9 +165,11 @@ int main(int argc, char *argv[])
     }
 
     // Both normal completion and exceptions reach this cleanup.
-    if (gpuBuffer != nullptr)
+    for (void *allocation : {static_cast<void *>(gpuScores), static_cast<void *>(gpuQuery), gpuBuffer})
     {
-        const cudaError_t freeStatus = cudaFree(gpuBuffer);
+        if (allocation == nullptr)
+            continue;
+        const cudaError_t freeStatus = cudaFree(allocation);
         if (freeStatus != cudaSuccess)
         {
             std::cerr << "CUDA deallocation: " << cudaGetErrorString(freeStatus) << '\n';
