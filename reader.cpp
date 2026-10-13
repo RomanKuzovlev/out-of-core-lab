@@ -30,6 +30,12 @@ __global__ void dotProducts(const float *blockOfVectors, const float *query,
     scores[i] = score;
 }
 
+void handleCuda(cudaError_t status, const char *operation)
+{
+    if (status != cudaSuccess)
+        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+}
+
 int main(int argc, char *argv[])
 {
     constexpr std::size_t blockSize = 4096 * 1024; // 4 MiB
@@ -86,34 +92,25 @@ int main(int argc, char *argv[])
 
         // CUDA. Query once, before reading. The count is valid only on success.
         int deviceCount = 0;
-        const cudaError_t status = cudaGetDeviceCount(&deviceCount);
-        if (status != cudaSuccess)
-            throw std::runtime_error(std::string("CUDA device query: ") + cudaGetErrorString(status));
+        handleCuda(cudaGetDeviceCount(&deviceCount), "CUDA device query");
         if (deviceCount == 0)
             throw std::runtime_error("No CUDA-capable GPU is available.");
         std::cerr << "CUDA devices available: " << deviceCount << '\n';
 
         // Allocate one block in GPU memory before the scan.
-        const cudaError_t allocationStatus = cudaMalloc(&gpuBuffer, blockSize);
-        if (allocationStatus != cudaSuccess)
-            throw std::runtime_error(std::string("CUDA allocation: ") + cudaGetErrorString(allocationStatus));
+        handleCuda(cudaMalloc(&gpuBuffer, blockSize), "CUDA allocation");
         std::cerr << "Allocated GPU buffer: " << blockSize << " bytes.\n";
 
         // A fixed all-ones query makes the first computation easy to verify.
         std::vector<float> query(dimensions, 1.0f);
         std::vector<float> scores(vectorsPerBlock); // RAM destination for future results.
 
-        const cudaError_t queryAllocationStatus = cudaMalloc(&gpuQuery, query.size() * sizeof(float));
-        if (queryAllocationStatus != cudaSuccess)
-            throw std::runtime_error(std::string("CUDA query allocation: ") + cudaGetErrorString(queryAllocationStatus));
-        const cudaError_t scoresAllocationStatus = cudaMalloc(&gpuScores, scores.size() * sizeof(float));
-        if (scoresAllocationStatus != cudaSuccess)
-            throw std::runtime_error(std::string("CUDA scores allocation: ") + cudaGetErrorString(scoresAllocationStatus));
+        handleCuda(cudaMalloc(&gpuQuery, query.size() * sizeof(float)), "CUDA query allocation");
+        handleCuda(cudaMalloc(&gpuScores, scores.size() * sizeof(float)), "CUDA scores allocation");
 
-        const cudaError_t queryCopyStatus = cudaMemcpy(gpuQuery, query.data(), query.size() * sizeof(float),
-                                                       cudaMemcpyHostToDevice);
-        if (queryCopyStatus != cudaSuccess)
-            throw std::runtime_error(std::string("CUDA query copy: ") + cudaGetErrorString(queryCopyStatus));
+        handleCuda(cudaMemcpy(gpuQuery, query.data(), query.size() * sizeof(float),
+                              cudaMemcpyHostToDevice),
+                   "CUDA query copy");
         // GPU scores need no initialization: the kernel will overwrite every valid slot.
         std::cerr << "Allocated query: " << query.size() * sizeof(float)
                   << " bytes; scores: " << scores.size() * sizeof(float) << " bytes.\n";
@@ -145,10 +142,9 @@ int main(int argc, char *argv[])
 
             // Copy the completed RAM block into the reusable GPU allocation.
             // This transfer is outside the disk-read latency measurement.
-            const cudaError_t copyStatus = cudaMemcpy(gpuBuffer, buffer.data(), blockSize,
-                                                      cudaMemcpyHostToDevice);
-            if (copyStatus != cudaSuccess)
-                throw std::runtime_error(std::string("CUDA host-to-device copy: ") + cudaGetErrorString(copyStatus));
+            handleCuda(cudaMemcpy(gpuBuffer, buffer.data(), blockSize,
+                                  cudaMemcpyHostToDevice),
+                       "CUDA host-to-device copy");
         }
 
         // Output only after the scan, preserving sequential request order
