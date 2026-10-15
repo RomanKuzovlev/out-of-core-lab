@@ -1,40 +1,19 @@
-#include <cuda_runtime.h>
-#include <device_launch_parameters.h>
+#include "cuda_workload.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <fcntl.h>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
-#include <string>
 #include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
 #include <vector>
-#include <chrono>
 
-constexpr unsigned int dimensions = 128;
-
-__global__ void dotProducts(const float *blockOfVectors, const float *query,
-                            float *scores, unsigned int vectorCount)
-{
-    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= vectorCount)
-        return;
-
-    float score = 0.0f;
-    for (unsigned int d = 0; d < dimensions; ++d)
-        score += blockOfVectors[i * dimensions + d] * query[d];
-    scores[i] = score;
-}
-
-void handleCuda(cudaError_t status, const char *operation)
-{
-    if (status != cudaSuccess)
-        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
-}
+constexpr unsigned int dimensions = CudaWorkload::dimensions;
 
 int main(int argc, char *argv[])
 {
@@ -43,7 +22,6 @@ int main(int argc, char *argv[])
                   "The dataset requires 32-bit IEEE 754 floats.");
     static_assert(blockSize % (dimensions * sizeof(float)) == 0,
                   "Each block must contain whole vectors.");
-    constexpr unsigned int vectorsPerBlock = blockSize / (dimensions * sizeof(float));
 
     if (argc > 2)
     {
@@ -65,10 +43,6 @@ int main(int argc, char *argv[])
     }
 
     int exitCode = 0;
-    // Keep the pointer in scope for cleanup even if the scan throws.
-    void *gpuBuffer = nullptr;
-    float *gpuQuery = nullptr;
-    float *gpuScores = nullptr;
     try
     {
         struct stat fileStat{};
@@ -90,30 +64,8 @@ int main(int argc, char *argv[])
             throw std::runtime_error("Too many blocks to store latency measurements.");
         measurements.reserve(static_cast<std::size_t>(blocksToRead));
 
-        // CUDA. Query once, before reading. The count is valid only on success.
-        int deviceCount = 0;
-        handleCuda(cudaGetDeviceCount(&deviceCount), "CUDA device query");
-        if (deviceCount == 0)
-            throw std::runtime_error("No CUDA-capable GPU is available.");
-        std::cerr << "CUDA devices available: " << deviceCount << '\n';
-
-        // Allocate one block in GPU memory before the scan.
-        handleCuda(cudaMalloc(&gpuBuffer, blockSize), "CUDA allocation");
-        std::cerr << "Allocated GPU buffer: " << blockSize << " bytes.\n";
-
-        // A fixed all-ones query makes the first computation easy to verify.
-        std::vector<float> query(dimensions, 1.0f);
-        std::vector<float> scores(vectorsPerBlock); // RAM destination for future results.
-
-        handleCuda(cudaMalloc(&gpuQuery, query.size() * sizeof(float)), "CUDA query allocation");
-        handleCuda(cudaMalloc(&gpuScores, scores.size() * sizeof(float)), "CUDA scores allocation");
-
-        handleCuda(cudaMemcpy(gpuQuery, query.data(), query.size() * sizeof(float),
-                              cudaMemcpyHostToDevice),
-                   "CUDA query copy");
-        // GPU scores need no initialization: the kernel will overwrite every valid slot.
-        std::cerr << "Allocated query: " << query.size() * sizeof(float)
-                  << " bytes; scores: " << scores.size() * sizeof(float) << " bytes.\n";
+        // GPU allocations are owned by this object and reused for the scan.
+        CudaWorkload gpu(blockSize);
 
         for (std::uint64_t blockIndex = 0; blockIndex < blocksToRead; ++blockIndex)
         {
@@ -142,9 +94,7 @@ int main(int argc, char *argv[])
 
             // Copy the completed RAM block into the reusable GPU allocation.
             // This transfer is outside the disk-read latency measurement.
-            handleCuda(cudaMemcpy(gpuBuffer, buffer.data(), blockSize,
-                                  cudaMemcpyHostToDevice),
-                       "CUDA host-to-device copy");
+            gpu.copyBlock(buffer.data());
         }
 
         // Output only after the scan, preserving sequential request order
@@ -153,6 +103,10 @@ int main(int argc, char *argv[])
         std::cout.precision(9);
         for (std::size_t i = 0; i < measurements.size(); ++i)
             std::cout << i << ',' << measurements[i].count() << '\n';
+
+        // Report cleanup failures on the normal path. Exceptions use the destructor.
+        if (!gpu.release())
+            exitCode = 1;
     }
     catch (const std::exception &error)
     {
@@ -160,20 +114,6 @@ int main(int argc, char *argv[])
         exitCode = 1;
     }
 
-    // Both normal completion and exceptions reach this cleanup.
-    for (void *allocation : {static_cast<void *>(gpuScores), static_cast<void *>(gpuQuery), gpuBuffer})
-    {
-        if (allocation == nullptr)
-            continue;
-        const cudaError_t freeStatus = cudaFree(allocation);
-        if (freeStatus != cudaSuccess)
-        {
-            std::cerr << "CUDA deallocation: " << cudaGetErrorString(freeStatus) << '\n';
-            exitCode = 1;
-        }
-        else
-            std::cerr << "Freed GPU buffer.\n";
-    }
     if (close(fd) == -1)
     {
         std::perror("close");
